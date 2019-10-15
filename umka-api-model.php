@@ -225,8 +225,7 @@ var $kktStatusDetail;
             curl_setopt($ch, CURLOPT_POSTFIELDS, $post_string); 
             curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
             curl_setopt($ch, CURLOPT_HTTPHEADER, array(                                                                          
-                'Content-Type: application/json',                                                                                
-                'Content-Length: ' . strlen($post_string))                                                                       
+                'Content-Type: application/json')
             );
         }
         curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
