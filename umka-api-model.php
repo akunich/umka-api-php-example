@@ -23,14 +23,15 @@ var $shopINN = 000000000000;
 //var $shopId = 1;
 //var $shopINN = 000000000000;
 
-var $debug = false;
+var $debug = true;
+var $debugDisplay = false;
 
 var $kktHttpAuth;
 # 0 - каcса не отвечает, 1 - отвечает. смена закрыта, 2 - отвечает и смена открыта
 var $kktStatus = 0;
 var $kktStatusDetail;
-
-	
+var $Summ = 0;
+    
 
    //конструктор выполнится при инициализации 
    function __construct() { 
@@ -47,7 +48,7 @@ var $kktStatusDetail;
       $status = $this->cashboxstatus(); 
       if(is_array($status)) {
           $this->kktStatusDetail = $status;
-          if($status['cashboxStatus']['fsStatus']['cycleIsOpen'] == 1) $result = 2;
+          if(@$status['cashboxStatus']['fsStatus']['cycleIsOpen'] == 1) $result = 2;
           else $result = 1;
       } else {
           $result = 0;
@@ -73,11 +74,21 @@ var $kktStatusDetail;
         return str_pad($this->shopId, 4, '0', STR_PAD_LEFT).str_pad($checkNumber, 16, '0', STR_PAD_LEFT);
    }
    
+    function makeSessionIdCancel($checkNumber) {
+        return str_pad($this->shopId, 4, '0', STR_PAD_LEFT).'5'.str_pad($checkNumber, 15, '0', STR_PAD_LEFT);
+    }
+    
+    function makeSessionIdCorrect($checkNumber) {
+        return str_pad($this->shopId, 4, '0', STR_PAD_LEFT).'7'.str_pad($checkNumber, 15, '0', STR_PAD_LEFT);
+    }
+   
    function makeFiscprop($data, $tag=false) {
         foreach ($data as $item) $result['fiscprops'][] = $item;
         if($tag) $result['tag'] = $tag;
         return $result;
    }
+   
+
    
    function makeFiscpropPosition($position) {
         # признак способа расчёта 
@@ -89,14 +100,23 @@ var $kktStatusDetail;
         $data[] = array('tag' => 1214, 'value' => 1);
         # признак предмета расчёта 
         # 1 - товар, 3 - работа, 4 - услуга (таблица 29)
-        $data[] = array('tag' => 1212, 'value' => 4);
-        # наименование предмета расчета (текст. до 128 символов)
-        if ($position['Comment'] != "") $name = substr($position['NameShort'].' ('.$position['Comment'].')', 0, 128);
-        else $name = substr($position['NameShort'], 0, 128);
+        
+        # тут лайфхак для поставки оборудования (если в биллинге указана поставка оборудования, то меняем тип с услуги на товар и в наименование пишем комментарий (конкретное наименование товара
+        if($position['NameShort'] == "Поставка оборудования") { 
+            $name = substr($position['Comment'], 0, 128);
+            $data[] = array('tag' => 1212, 'value' => 1);
+        } else {
+            $data[] = array('tag' => 1212, 'value' => 4);
+            # наименование предмета расчета (текст. до 128 символов)
+            if ($position['Comment'] != "") $name = substr($position['NameShort'].' ('.$position['Comment'].')', 0, 128);
+            else $name = substr($position['NameShort'], 0, 128);
+        }
+        
+        
         $data[] = array('tag' => 1030, 'value' => $name);
         # цена за единицу предмета расчета с учетом скидок и наценок
         # Передавать обязательно. В копейках
-        $summPos = ($position['Summ']/$position['Amount'])*100;
+        $summPos = ceil(($position['Summ']/$position['Amount'])*100);
         $data[] = array('tag' => 1079, 'value' => $summPos);
         # количество предмета расчета
         # Передавать обязательно. Строкой с 3 знаками после запятой.
@@ -113,11 +133,14 @@ var $kktStatusDetail;
         # тег признака "Предмет расчёта" - 1059
         $result = $this->makeFiscprop($data, 1059);
         
+        $this->Summ = $this->Summ + ($summPos*$position['Amount']);
+        
         return $result;
    }
    
-   function fiscalcheck($invoice, $positions) {
+   function fiscalcheck($invoice, $positions, $moneyType = 2) {
        
+        $this->Summ = 0;
         $sessionId = $this->makeSessionId($invoice['ID']);
         
         # Уникальное ИД сессии (генерируется самостоятельно и должно быть уникальным для каждого чека)
@@ -159,28 +182,130 @@ var $kktStatusDetail;
 //        $request['document']['data']['fiscprops'][] = array('tag' => 1117, 'value' => $this->kktStatusDetail['cashboxStatus']['email']);
         
         
-//        # наименование дополнительного реквизита пользователя
-//        $data[] = array('tag' => 1085, 'value' => 'Служба поддержки');
-//        # значение дополнительного реквизита пользователя
-//        $data[] = array('tag' => 1086, 'value' => '8 800 77 55 771');
-//        # упаковка фискального свойства с тегом 
-//        # дополнительный реквизит пользователя (тег 1084)
-//        $request['document']['data']['fiscprops'][] = $this->makeFiscprop($data, 1084);
-//        unset($data);
+        # наименование дополнительного реквизита пользователя
+        $data[] = array('tag' => 1085, 'value' => 'Служба поддержки');
+        # значение дополнительного реквизита пользователя
+        $data[] = array('tag' => 1086, 'value' => '8 800 ........');
+        # упаковка фискального свойства с тегом 
+        # дополнительный реквизит пользователя (тег 1084)
+        $request['document']['data']['fiscprops'][] = $this->makeFiscprop($data, 1084);
+        unset($data);
         
         
         foreach($positions as $position) {
             $request['document']['data']['fiscprops'][] = $this->makeFiscpropPosition($position);
         }
         
-
+        
+        # проверка, что подсчитанная сумма не превышает реальную более чем на 10%
+        file_put_contents('/tmp/'.$invoice['ID'].'-export-fs-summ.txt', $this->Summ."\n".$request['document']['data']['sum']);
+        if($this->Summ <= ($request['document']['data']['sum']*1.1)) $request['document']['data']['sum'] = $this->Summ;
+        
+        
       $request = json_encode($request, JSON_UNESCAPED_UNICODE);
       
       $answer = $this->kktRequest('fiscalcheck.json', $request);
       
-  
+      # для логирования на всякий случай
+      file_put_contents('/tmp/'.$invoice['ID'].'-export-fs-request.txt', $request);
+      file_put_contents('/tmp/'.$invoice['ID'].'-export-fs-answer.txt', json_encode($answer, JSON_UNESCAPED_UNICODE));
+      
       return $answer;
    }
+   
+   
+   
+   function fiscalcheckCancel($invoice, $positions, $moneyType = 2) {
+       
+        $this->Summ = 0;
+        $sessionId = $this->makeSessionIdCancel($invoice['ID']);
+        
+        # Уникальное ИД сессии (генерируется самостоятельно и должно быть уникальным для каждого чека)
+        $request['document']['sessionId'] = $sessionId;
+        # Флаг необходимости печати чека
+        $request['document']['print'] = 1;
+        $request['document']['data']['docName'] = 'Бланк строгой отчетности';
+        # Тип документа (1. Продажа, 2.Возврат продажи, 4. Покупка, 5. Возврат покупки, 7. Коррекция прихода, 9. Коррекция расхода)
+        $request['document']['data']['type'] = 2;
+        # ТИП ОПЛАТЫ (1. Наличным, 2. Электронными, 3. Предоплата, 4. Постоплата, 5. Встречное предоставление)
+        $request['document']['data']['moneyType'] = $moneyType;
+        # Сумма закрытия чека (может быть 0, если без сдачи) в копейках
+        $request['document']['data']['sum'] = $invoice['Summ']*100;
+        $request['document']['result'] = 0;
+        
+        # тег отмены. Берём данные ФПД из ранее выписанного чека
+        if(file_exists('/tmp/'.$invoice['ID'].'-export-fs-answer.txt')) {
+            $jsonFiscalCheck = json_decode(file_get_contents('/tmp/'.$invoice['ID'].'-export-fs-answer.txt'), true);
+            $result = $this->findFiscProps($jsonFiscalCheck, 1077, 0);
+            if(count($result)==1) {
+                $request['document']['data']['fiscprops'][] = array('tag' => 1192, 'value' => $result['0']);
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        
+        
+        # применяемая система налогообложения (применяется битовое значение) См. (номер бита - значение)
+        # (0 - 1) - ОСН, (1 - 2) - УСН доход, (2 - 4) - УСН доход - расход, (3 - 8) - ЕНВД, (4 - 16) - ЕСН, (5 - 32) - Патент
+        $request['document']['data']['fiscprops'][] = array('tag' => 1055, 'value' => 2);
+        # регистрационный номер ККТ (20 символов, до установленной длины дополняется пробелами справа)
+        # Берется из регистрационных данных в ФН. Если передавать в чеке, то чек будет оформлен 
+        # только при совпадении переданного РНМ и РНМ, с которым касса зарегистрирована
+//        $request['document']['data']['fiscprops'][] = array('tag' => 1037, 'value' => str_pad($this->kktStatusDetail['cashboxStatus']['regNumber'], 20, ' ', STR_PAD_RIGHT));
+        # сумма по чеку (БСО) электронными 
+        # Величина с учетом копеек, печатается в виде числа с фиксированной точкой (2 цифры после точки) в рублях - налоговая 
+        # Обязательно передавать только при использовании нескольких типов оплат. Передается в копейках. - касса 
+//        $request['document']['data']['fiscprops'][] = array('tag' => 1081, 'value' => $invoice['Summ']);
+        # ИНН пользователя
+        # Берется из регистрационных данных в ФН. Если передавать в чеке, то чек будет
+        # оформлен только при совпадении переданного инн и инн, с которым касса зарегистрирована
+//        $request['document']['data']['fiscprops'][] = array('tag' => 1018, 'value' => $this->shopINN);
+        # признак расчета. 1 - <ПРИХОД>, 3 - <РАСХОД>, 2 - <ВОЗВРАТ ПРИХОДА>, 4 - <ВОЗВРАТ РАСХОДА>
+        $request['document']['data']['fiscprops'][] = array('tag' => 1054, 'value' => 2);
+        # телефон или электронный адрес покупателя
+        $request['document']['data']['fiscprops'][] = array('tag' => 1008, 'value' => $invoice['Email']);
+        # адрес сайта ФНС
+        $request['document']['data']['fiscprops'][] = array('tag' => 1060, 'value' => $this->kktStatusDetail['cashboxStatus']['fnsSite']);
+        # email отправителя чека
+        # Передавать не нужно. Берется из регистрационных данных в ФН.
+//        $request['document']['data']['fiscprops'][] = array('tag' => 1117, 'value' => $this->kktStatusDetail['cashboxStatus']['email']);
+        
+        
+        # наименование дополнительного реквизита пользователя
+        $data[] = array('tag' => 1085, 'value' => 'Служба поддержки ');
+        # значение дополнительного реквизита пользователя
+        $data[] = array('tag' => 1086, 'value' => '8 800 ..........');
+        # упаковка фискального свойства с тегом 
+        # дополнительный реквизит пользователя (тег 1084)
+        $request['document']['data']['fiscprops'][] = $this->makeFiscprop($data, 1084);
+        unset($data);
+        
+        
+        foreach($positions as $position) {
+            $request['document']['data']['fiscprops'][] = $this->makeFiscpropPosition($position);
+        }
+        
+        
+        # проверка, что подсчитанная сумма не превышает реальную более чем на 10%
+        file_put_contents('/tmp/'.$invoice['ID'].'-export-fsc-summ.txt', $this->Summ."\n".$request['document']['data']['sum']);
+        if($this->Summ <= ($request['document']['data']['sum']*1.1)) $request['document']['data']['sum'] = $this->Summ;
+        
+        
+      $request = json_encode($request, JSON_UNESCAPED_UNICODE);
+      
+      $answer = $this->kktRequest('fiscalcheck.json', $request);
+      
+      # для логирования на всякий случай
+      file_put_contents('/tmp/'.$invoice['ID'].'-export-fsc-request.txt', $request);
+      file_put_contents('/tmp/'.$invoice['ID'].'-export-fsc-answer.txt', json_encode($answer, JSON_UNESCAPED_UNICODE));
+      
+      return $answer;
+   }
+   
+   
+
    
    function kktRequest($request, $post=false) {
       $answer = $this->getUrl($this->kktUrl.'/'.$request, $post);
@@ -198,13 +323,40 @@ var $kktStatusDetail;
       }
    }
    
+   
+    # функция рекурсивно ищет в массиве массив в котором есть ключ tag с искомым значением  $tag и возвращает 
+    # при $parrent == 0 значение value из найденного массива
+    # при $parrent == 1 значение весь найденный массив
+    # при $parrent == 2 весь вешестоящий массив, в котором найден искомый массив (с нужным тегом)
+    # ввиду того, что некоторые теги в чеке могут быть встречены ни один раз, найденные результаты помещаются в массив с числовыми ключами (от ноля и далее)   
+    function findFiscProps($data, $tag, $parrent=0) {  
+    	$result = array();
+        
+        if(is_array($data)) foreach ($data as $key=>$value) {
+     	      if(isset($value['tag']) && $value['tag'] == $tag) {
+                  if($parrent==2) $result = array_merge($result, array($data));
+                  elseif($parrent==1) $result = array_merge($result, array($value));
+                  else $result = array_merge($result, array($value['value']));
+              } else {
+                  $tmp = $this->findFiscProps($value, $tag, $parrent);
+                  if(count($tmp)>0) $result = array_merge($result, $tmp);
+              }
+        }
+        return $result;
+    } 
+    
+    
+   
    function debugvar($var) {
        if($this->debug) {
            echo "<br>\n debugvar umkaApiModel\n<br>\n";
-           if(is_object($var) || is_array($var)) var_dump($var);
-           else print_r($var."<br>\n<br>\n");
-           
-           flush();
+           $logStr = var_export($var, true);
+           file_put_contents("/tmp/debug.log", date(DATE_ATOM)."\n".$logStr."\n\n", FILE_APPEND); 
+           if($this->debugDisplay) { echo $logStr; flush(); } 
+//            if(is_object($var) || is_array($var)) var_dump($var);
+//            else print_r($var."<br>\n<br>\n");
+//            
+//            flush();
        }
        return;
    }
